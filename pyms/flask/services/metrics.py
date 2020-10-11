@@ -3,22 +3,44 @@ import logging
 from typing import Text
 
 from flask import Blueprint, Response, request
-from prometheus_client import Counter, Histogram, generate_latest
 from pyms.flask.services.driver import DriverService
+
+from prometheus_client import generate_latest
+from opentelemetry import metrics
+from opentelemetry.exporter.prometheus import PrometheusMetricsExporter
+from opentelemetry.sdk.metrics.export import ConsoleMetricsExporter
+from opentelemetry.sdk.metrics import Counter, ValueRecorder, MeterProvider
 
 # Based on https://github.com/sbarratt/flask-prometheus
 # and https://github.com/korfuri/python-logging-prometheus/
 
-FLASK_REQUEST_LATENCY = Histogram(
-    "http_server_requests_seconds", "Flask Request Latency", ["service", "method", "uri", "status"]
-)
-FLASK_REQUEST_COUNT = Counter(
-    "http_server_requests_count", "Flask Request Count", ["service", "method", "uri", "status"]
-)
+metrics.set_meter_provider(MeterProvider())
+meter = metrics.get_meter(__name__)
+exporter = PrometheusMetricsExporter()
+metrics.get_meter_provider().start_pipeline(meter, exporter, 1)
 
-LOGGER_TOTAL_MESSAGES = Counter(
+FLASK_REQUEST_LATENCY = meter.create_metric(
+    "http_server_requests_seconds",
+    "Flask Request Latency",
+    "http_server_requests_seconds",
+    float,
+    ValueRecorder,
+    ("service", "method", "uri", "status"),
+)
+FLASK_REQUEST_COUNT = meter.create_metric(
+    "http_server_requests_count",
+    "Flask Request Count",
+    "http_server_requests_count",
+    int,
+    Counter,
+    ["service", "method", "uri", "status"],
+)
+LOGGER_TOTAL_MESSAGES = meter.create_metric(
     "logger_messages_total",
     "Count of log entries by service and level.",
+    "logger_messages_total",
+    int,
+    Counter,
     ["service", "level"],
 )
 
@@ -36,20 +58,28 @@ class FlaskMetricsWrapper():
         else:
             path = request.path
         request_latency = time.time() - request.start_time
-        FLASK_REQUEST_LATENCY.labels(self.app_name, request.method, path, response.status_code).observe(request_latency)
-        FLASK_REQUEST_COUNT.labels(self.app_name, request.method, path, response.status_code).inc()
+        labels = {
+            "service": self.app_name,
+            "method": str(request.method),
+            "uri": path,
+            "status": str(response.status_code),
+        }
+
+        FLASK_REQUEST_LATENCY.record(request_latency, labels)
+        FLASK_REQUEST_COUNT.add(1, labels)
 
         return response
 
 
 class Service(DriverService):
     """
-    Adds [Prometheus](https://prometheus.io/) metrics using the [Prometheus Client Library](https://github.com/prometheus/client_python).
+    Adds [Prometheus](https://prometheus.io/) metrics using the [Opentelemetry Client Library](https://opentelemetry-python.readthedocs.io/en/latest/exporter/prometheus/prometheus.html).
     """
     config_resource: Text = "metrics"
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+
         self.metrics_blueprint = Blueprint("metrics", __name__)
         self.serve_metrics()
 
@@ -79,7 +109,8 @@ class MetricsLogHandler(logging.Handler):
 
     def __init__(self, app_name):
         super().__init__()
-        self.app_name = app_name
+        self.app_name = str(app_name)
 
     def emit(self, record):
-        LOGGER_TOTAL_MESSAGES.labels(self.app_name, record.levelname).inc()
+        labels = {"service": self.app_name, "level": record.levelname}
+        LOGGER_TOTAL_MESSAGES.add(1, labels)
